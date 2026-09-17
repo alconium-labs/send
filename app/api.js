@@ -240,7 +240,7 @@ async function upload(
         ws.readyState === WebSocket.OPEN &&
         !canceller.cancelled
       ) {
-        await delay();
+        await delay(4);
       }
     }
     if (ws.readyState === WebSocket.OPEN) {
