@@ -1,0 +1,142 @@
+name: "Project Build & Push Multi-Arch Using Matrix to GHCR"
+
+# 수동 실행
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# 환경 변수 설정
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # 1) 아키텍처별 이미지 Build & Push
+  # ──────────────────────────────────────────────────────────────
+  build:
+    environment: container-publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            cache-from: type=gha,scope=docker-amd64
+            cache-to: type=gha,mode=max,scope=docker-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=docker-arm64
+            cache-to: type=gha,mode=max,scope=docker-arm64
+    
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # 1. 소스 코드 체크아웃
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # 2. Docker Buildx 설정
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      
+      # 3. GHCR 로그인
+      - name: Log in to the GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5. 아키텍처별 단일 이미지 빌드 & Digest 값으로 푸시
+      - name:  Build & Push ${{ matrix.arch }} by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: ${{ matrix.cache-from }}
+          cache-to: ${{ matrix.cache-to }}
+
+      # 6. 생성된 Digest 값을 파일로 저장
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      
+      # 7. Digest 아티팩트 업로드 (Merge 작업에서 사용)
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+          
+  # ──────────────────────────────────────────────────────────────
+  # 2) 다중 아키텍처 Manifest 생성
+  # ──────────────────────────────────────────────────────────────
+  merge:
+    name: Create & Push Multi-Arch Manifest
+    needs: [build]
+    runs-on: ubuntu-24.04
+    environment: container-publish
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to the GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          args=()
+          for digest_file in *; do
+            args+=("${IMAGE_NAME}@sha256:${digest_file}")
+          done
+          tags=(-t "${IMAGE_NAME}:${{ github.ref_name }}" -t "${IMAGE_NAME}:latest")
+          for i in 1 2 3; do
+            if docker buildx imagetools create "${tags[@]}" "${args[@]}"; then
+              break
+            fi
+            if [ "$i" = 3 ]; then
+              echo "::error::imagetools create failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::imagetools create failed (attempt $i); retrying in 20s"
+            sleep 20
+          done
+      - name: Inspect image
+        env:
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE_NAME}:latest"
